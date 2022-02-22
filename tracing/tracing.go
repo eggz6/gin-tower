@@ -1,9 +1,13 @@
 package tracing
 
 import (
+	"context"
 	"io"
-	"io/ioutil"
+	"net"
+	"net/http"
+	"net/http/httptrace"
 	"runtime/debug"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -16,6 +20,15 @@ import (
 	"github.com/uber/jaeger-client-go/log"
 	"github.com/uber/jaeger-lib/metrics"
 )
+
+func init() {
+	t, closer, err := NewGlobalTracer("example")
+	if err != nil {
+		panic(err)
+	}
+	defer closer.Close()
+	opentracing.SetGlobalTracer(t)
+}
 
 func NewGlobalTracer(name string) (opentracing.Tracer, io.Closer, error) {
 	cfg := config.Configuration{
@@ -66,12 +79,6 @@ func OpenTracing() gin.HandlerFunc {
 		opentracing.Tag{Key: "request.time", Value: time.Now().Format(time.RFC3339)}.Set(serverSpan)
 		opentracing.Tag{Key: "http.server.mode", Value: gin.Mode()}.Set(serverSpan)
 
-		// TODO 不记录body
-		body, err := ioutil.ReadAll(c.Request.Body)
-		if err == nil {
-			opentracing.Tag{Key: "http.request_body", Value: string(body)}.Set(serverSpan)
-		}
-
 		c.Request = c.Request.WithContext(opentracing.ContextWithSpan(c.Request.Context(), serverSpan))
 
 		c.Next()
@@ -82,4 +89,54 @@ func OpenTracing() gin.HandlerFunc {
 		ext.HTTPStatusCode.Set(serverSpan, uint16(c.Writer.Status()))
 		opentracing.Tag{Key: "request.errors", Value: c.Errors.String()}.Set(serverSpan)
 	}
+}
+
+// ContextToHTTP returns an http RequestFunc that injects an OpenTracing Span
+// found in `ctx` into the http headers. If no such Span can be found, the
+// RequestFunc is a noop.
+func ContextToHTTP(ctx context.Context, tracer opentracing.Tracer, req *http.Request) (nReq *http.Request) {
+	// Try to find a Span in the Context.
+	span := opentracing.SpanFromContext(ctx)
+	if span == nil {
+		return req
+	}
+
+	// http trace
+	r := &requestTracer{sp: span}
+	nCtx := httptrace.WithClientTrace(ctx, r.clientTrace())
+	nReq = req.WithContext(nCtx)
+
+	// Add standard OpenTracing tags.
+	ext.HTTPMethod.Set(span, nReq.Method)
+	ext.HTTPUrl.Set(span, nReq.URL.String())
+	host, portString, err := net.SplitHostPort(nReq.URL.Host)
+	if err == nil {
+		ext.PeerHostname.Set(span, host)
+		if port, err := strconv.Atoi(portString); err != nil {
+			ext.PeerPort.Set(span, uint16(port))
+		}
+	} else {
+		ext.PeerHostname.Set(span, nReq.URL.Host)
+	}
+
+	// There's nothing we can do with any errors here.
+	tracer.Inject(span.Context(), opentracing.HTTPHeaders, opentracing.HTTPHeadersCarrier(nReq.Header))
+	return nReq
+}
+
+// HTTPToContext returns an http RequestFunc that tries to join with an
+// OpenTracing trace found in `req` and starts a new Span called
+// `operationName` accordingly. If no trace could be found in `req`, the Span
+// will be a trace root. The Span is incorporated in the returned Context and
+// can be retrieved with opentracing.SpanFromContext(ctx).
+func HTTPToContext(tracer opentracing.Tracer, req *http.Request, operationName string) context.Context {
+	// Try to join to a trace propagated in `req`.
+	var span opentracing.Span
+	wireContext, _ := tracer.Extract(opentracing.HTTPHeaders, opentracing.HTTPHeadersCarrier(req.Header))
+	span = tracer.StartSpan(operationName, ext.RPCServerOption(wireContext))
+	ext.HTTPMethod.Set(span, req.Method)
+	ext.HTTPUrl.Set(span, req.URL.String())
+	ip, _, _ := net.SplitHostPort(req.RemoteAddr)
+	ext.PeerHostIPv4.SetString(span, ip)
+	return opentracing.ContextWithSpan(context.Background(), span)
 }
