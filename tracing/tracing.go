@@ -8,27 +8,21 @@ import (
 	"net/http/httptrace"
 	"runtime/debug"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/opentracing/opentracing-go"
+	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
 
-	"github.com/uber/jaeger-client-go"
+	jaeger "github.com/uber/jaeger-client-go"
 	"github.com/uber/jaeger-client-go/config"
 	"github.com/uber/jaeger-client-go/log"
 	"github.com/uber/jaeger-lib/metrics"
 )
 
-func init() {
-	t, closer, err := NewGlobalTracer("example")
-	if err != nil {
-		panic(err)
-	}
-	defer closer.Close()
-	opentracing.SetGlobalTracer(t)
-}
+var openOnce sync.Once
 
 func NewGlobalTracer(name string) (opentracing.Tracer, io.Closer, error) {
 	cfg := config.Configuration{
@@ -48,7 +42,6 @@ func NewGlobalTracer(name string) (opentracing.Tracer, io.Closer, error) {
 	tracer, closer, err := cfg.NewTracer(
 		config.Logger(jLogger),
 		config.Metrics(jMetricsFactory),
-		// 设置最大 Tag 长度，根据情况设置
 		config.MaxTagValueLength(65535),
 	)
 	if err != nil {
@@ -56,6 +49,28 @@ func NewGlobalTracer(name string) (opentracing.Tracer, io.Closer, error) {
 	}
 
 	return tracer, closer, err
+}
+
+func Open(name string) (gin.HandlerFunc, io.Closer, error) {
+	var closer io.Closer
+	var err error
+
+	openOnce.Do(func() {
+		t, c, e := NewGlobalTracer(name)
+		if e != nil {
+			err = e
+			return
+		}
+
+		closer = c
+		opentracing.SetGlobalTracer(t)
+	})
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return OpenTracing(), closer, nil
 }
 
 func OpenTracing() gin.HandlerFunc {
@@ -69,17 +84,29 @@ func OpenTracing() gin.HandlerFunc {
 			c.Request.URL.Path,
 			ext.RPCServerOption(wireCtx),
 		)
+
+		spCtx, ok := serverSpan.Context().(*jaeger.SpanContext)
+		var traceID string
+		if ok {
+			traceID = spCtx.TraceID().String()
+			c.Set("Trace-ID", traceID)
+		}
+
 		defer serverSpan.Finish()
 
 		ext.HTTPUrl.Set(serverSpan, c.Request.URL.Path)
 		ext.HTTPMethod.Set(serverSpan, c.Request.Method)
+		ip, _, _ := net.SplitHostPort(c.Request.RemoteAddr)
+		ext.PeerHostIPv4.SetString(serverSpan, ip)
 		ext.Component.Set(serverSpan, "Gin-Http")
 		opentracing.Tag{Key: "http.headers.x-forwarded-for", Value: c.Request.Header.Get("X-Forwarded-For")}.Set(serverSpan)
 		opentracing.Tag{Key: "http.headers.user-agent", Value: c.Request.Header.Get("User-Agent")}.Set(serverSpan)
 		opentracing.Tag{Key: "request.time", Value: time.Now().Format(time.RFC3339)}.Set(serverSpan)
 		opentracing.Tag{Key: "http.server.mode", Value: gin.Mode()}.Set(serverSpan)
 
-		c.Request = c.Request.WithContext(opentracing.ContextWithSpan(c.Request.Context(), serverSpan))
+		reqCtx := context.WithValue(c.Request.Context(), "Trace-ID", traceID)
+
+		c.Request = c.Request.WithContext(opentracing.ContextWithSpan(reqCtx, serverSpan))
 
 		c.Next()
 		if gin.Mode() == gin.DebugMode {
@@ -100,6 +127,13 @@ func ContextToHTTP(ctx context.Context, tracer opentracing.Tracer, req *http.Req
 	if span == nil {
 		return req
 	}
+
+	span = opentracing.StartSpan(req.URL.Path,
+		opentracing.ChildOf(span.Context()),
+		opentracing.Tag{Key: string(ext.Component), Value: "HTTP"},
+		ext.SpanKindRPCClient,
+	)
+	defer span.Finish()
 
 	// http trace
 	r := &requestTracer{sp: span}
@@ -139,4 +173,19 @@ func HTTPToContext(tracer opentracing.Tracer, req *http.Request, operationName s
 	ip, _, _ := net.SplitHostPort(req.RemoteAddr)
 	ext.PeerHostIPv4.SetString(span, ip)
 	return opentracing.ContextWithSpan(context.Background(), span)
+}
+
+func ExtractSpanFromCtx(ctx context.Context) opentracing.Span {
+	return opentracing.SpanFromContext(ctx)
+}
+
+func ExtractTraceIDFromCtx(ctx context.Context) string {
+	span := ExtractSpanFromCtx(ctx)
+
+	spCtx, ok := span.Context().(*jaeger.SpanContext)
+	if !ok {
+		return ""
+	}
+
+	return spCtx.String()
 }

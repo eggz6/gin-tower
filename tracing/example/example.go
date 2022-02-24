@@ -1,38 +1,54 @@
 package main
 
 import (
-	"fmt"
+	"context"
+	"log"
 	"net/http"
 
 	"github.com/eggz6/gin-tower/tracing"
 	"github.com/gin-gonic/gin"
-	"github.com/opentracing/opentracing-go"
+	opentracing "github.com/opentracing/opentracing-go"
 )
 
 func main() {
-	t, closer, err := tracing.NewGlobalTracer("example")
+	openTracing, closer, err := tracing.Open("example")
 	if err != nil {
-		panic(err)
+		log.Fatalf("open tracing failed. err=%v", err)
 	}
-	defer closer.Close()
-	opentracing.SetGlobalTracer(t)
-	r := gin.Default()
-	// 注入先前编写的中间件
-	r.Use(tracing.OpenTracing())
-	r.GET("/ping", func(c *gin.Context) {
-		fmt.Println(c.Request.Header)
-		req, err := http.NewRequestWithContext(c, "GET", "http://www.baidi.com", nil)
-		if err != nil {
-			fmt.Println("new req failed. ", err)
 
-		} else {
-			fmt.Println("req header", req.Header)
-		}
+	defer closer.Close()
+
+	r := gin.Default()
+	r.Use(openTracing)
+	r.GET("/ping", func(c *gin.Context) {
+		call(c.Request.Context())
 
 		c.JSON(200, gin.H{
 			"message": "pong",
 		})
 	})
-	r.Run()
 
+	r.GET("/hello", func(c *gin.Context) {
+		c.JSON(200, gin.H{
+			"message": "world",
+		})
+	})
+
+	r.Run()
+}
+
+func call(ctx context.Context) error {
+	req, err := http.NewRequest("GET", "http://localhost:8080/hello", nil)
+	if err != nil {
+		return err
+	}
+
+	tracer := opentracing.GlobalTracer()
+
+	req = tracing.ContextToHTTP(ctx, tracer, req)
+
+	cli := http.Client{}
+	cli.Do(req)
+
+	return nil
 }
